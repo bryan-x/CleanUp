@@ -3,6 +3,11 @@
 // 컴파일러: AVRSTUDIO7
 //Ver v1.1  , 제작: SED(SeMin DIY)
 //20180606 UPDATE
+
+//Ver v2.0  , 제작: SED(SeMin DIY)
+// 추가된기능
+// 1. 디지털 캘리브레이션 기능 추가
+//상업적 금지! , 원작자 표시 조건하에 공유 및 수정 가능!
  
 #include <avr/io.h>
 #include <util/delay.h>
@@ -41,7 +46,7 @@
 #define EEPROM_RUN_MODE 0X30
 #define EEPROM_DUST_CLEAN 0X00
 #define EEPROM_LED_LIGHT 0X40
-#define DEFULT_DUST_CLEAN 0.295762
+#define DEFULT_DUST_CLEAN 0.105000
 #define DEFULT_RUN_MODE 0
 #define DEFULT_LED_LIGHT 5
 #define DUST_average 40
@@ -54,9 +59,11 @@
 #define RX_WRITE_DISABLE 0XFB
 #define RX_RUN_MODE_ADDRESS 1
 #define RX_LED_LIGHT_ADDRESS 2
+#define RX_CLEAN_DB_ENABLE_ADDRESS 3
+#define RX_CLEAN_DB_DATA_ADDRESS 4
  
 char command0[30];
-char rx_db[4];
+char rx_db[10];
 char rx_counter=0;
 char rx_write_enable=0;
  
@@ -65,7 +72,6 @@ int dust_status=0;
 int dust_status_sum=0; //평균값
 char dust_status_temp=0;
 float smoothADC = 0.0; //임시
- 
  
 unsigned char button_click=0; //버튼 클릭 시간 체크
 uint8_t run_mode; //공기청정기 모드
@@ -99,8 +105,21 @@ char eep_write_enable =0;
  
 1비트: Run_mode(0~5)
 2비트: LED 밝기제어 (0 ~ 10)
+3비트: 캘리브레이션 ENABLE 명령어
+4비트: 캘리브레이션 값(m3ug)
  
 */
+ 
+void calibration_clean_db(int set_m3ug ,  char enable){
+    //디지털 센서 값을 보고 캘리브레이션 하는 방식
+    //공식 clean_db 값 = 현재값 - (m3ug(블루투스로 전송받은값) * 0.005);
+    
+    if(enable == ON){
+        dust_clean_db = smoothADC - (set_m3ug * 0.005);
+    }
+    
+}
+ 
 ISR(USART_RX_vect){
     char RX;
     RX=UDR0;
@@ -112,6 +131,10 @@ ISR(USART_RX_vect){
         //sprintf(command0,"ok/ %d,%d,%d\r\n",rx_db[0],rx_db[1],rx_db[2]); TX0_STR(command0); //테스트용
         run_mode=rx_db[RX_RUN_MODE_ADDRESS]; //값 대입
         led_light=rx_db[RX_LED_LIGHT_ADDRESS]; //값 대입
+        
+        calibration_clean_db(rx_db[RX_CLEAN_DB_DATA_ADDRESS],rx_db[RX_CLEAN_DB_ENABLE_ADDRESS]);
+        
+        rx_db[RX_CLEAN_DB_ENABLE_ADDRESS] = OFF; //초기화
         eep_write_enable=ON; // EEPROM 저장 명령어 활성화
     }
     
@@ -311,6 +334,7 @@ int main(void){
             if(eep_write_enable == ON){//RUN 모드는 버튼 + 블루투스에서 2개에서 명령이 내려와서 , 한곳에서 통합 저장할수 있도록함
                 eeprom_write_byte((uint8_t*)EEPROM_RUN_MODE,run_mode);//run 값 저장
                 eeprom_write_byte((uint8_t*)EEPROM_LED_LIGHT,led_light);
+                eeprom_write_float((float*)EEPROM_DUST_CLEAN,dust_clean_db);
                     
                 eep_write_enable=OFF; //지가 종료 끄기
             }

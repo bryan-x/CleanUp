@@ -1,12 +1,9 @@
 //DIY 공기청정기: Clean UP! Program 소스
-//MCU: ATMEAG328P / 16MHz / 5V 사용
-// 컴파일러: AVRSTUDIO7
-//Ver v1.1  , 제작: SED(SeMin DIY)
-//20180606 UPDATE
-
-//Ver v2.0  , 제작: SED(SeMin DIY)
+//Ver v3.0  , 제작: SED(SeMin DIY)
 // 추가된기능
-// 1. 디지털 캘리브레이션 기능 추가
+// 1. 안정화된 미세먼지 센싱
+// 2. 수동 캘리브레이션 모드 동작 오류 수정
+// 3. 블루투스 데이터 전송 방식 수정
 //상업적 금지! , 원작자 표시 조건하에 공유 및 수정 가능!
  
 #include <avr/io.h>
@@ -40,8 +37,8 @@
  
 #define DUST_MAX 500
 #define DUST_HI 500
-#define DUST_MIDIUM 50
-#define DUST_CLEAN 15
+#define DUST_MIDIUM 75
+#define DUST_CLEAN 35
  
 #define EEPROM_RUN_MODE 0X30
 #define EEPROM_DUST_CLEAN 0X00
@@ -61,6 +58,10 @@
 #define RX_LED_LIGHT_ADDRESS 2
 #define RX_CLEAN_DB_ENABLE_ADDRESS 3
 #define RX_CLEAN_DB_DATA_ADDRESS 4
+//---------------------------------
+#define AVG_DUST_VOLTAGE_QCNT 30
+ 
+int err_count=0;
  
 char command0[30];
 char rx_db[10];
@@ -73,11 +74,13 @@ int dust_status_sum=0; //평균값
 char dust_status_temp=0;
 float smoothADC = 0.0; //임시
  
+ 
 unsigned char button_click=0; //버튼 클릭 시간 체크
 uint8_t run_mode; //공기청정기 모드
 uint8_t led_light=0;
 uint16_t eep_dust_clean;
 float dust_clean_db; //Clean 했을때 기준값
+float dust_clean_db_1; //Clean 했을때 기준값
 //--------------------
 unsigned int fan_speed_db[3]={FAN_SPEED_LOW,FAN_SPEED_MIDDILE,FAN_SPEED_HI};
  
@@ -98,6 +101,11 @@ char eep_data=0;
 float eep_test=0;
 char eep_write_enable =0;
   
+  
+ float ugm3_test=0;
+ 
+ float dustVout;
+ float dust_ugm3;
 //----------------------------------
 /*/
 시작비트: 0XFD
@@ -115,7 +123,7 @@ void calibration_clean_db(int set_m3ug ,  char enable){
     //공식 clean_db 값 = 현재값 - (m3ug(블루투스로 전송받은값) * 0.005);
     
     if(enable == ON){
-        dust_clean_db = smoothADC - (set_m3ug * 0.005);
+        dust_clean_db = dustVout - (set_m3ug * 0.005);
     }
     
 }
@@ -144,10 +152,15 @@ ISR(USART_RX_vect){
                 led_blink_counter=5; //led 5회 깜빡여라
             }
         }
+        
         rx_db[rx_counter] = RX;
         rx_counter++;
+        
     }            
+    
 }
+ 
+ 
  
 ISR(TIMER0_COMPA_vect){ //LED 깜빡임
     if(++timer_counter == 20){ // 5ms x 70 = 350ms    
@@ -172,23 +185,58 @@ ISR(TIMER0_COMPA_vect){ //LED 깜빡임
     
 }
  
-int ADC_Dust(){
-    static int  dust_mgm3 =0,i,SUM,AVG=0; //단위 변환
+ 
+ 
+ 
+ 
+float getAvgDustVoltage() {
+    static unsigned long sumVoutReadValue;
+    static unsigned long avgVoutReadValue;
+    static int qVoutReadValue[AVG_DUST_VOLTAGE_QCNT];
+    static int qIdx = 0;
     
-    SENSOR_LED_ON; //LED 키기
-    _delay_us(280);
-    SUM=0;
-    for(i=0;i<64;i++){ ADCSRA=0xD7; while(!(ADCSRA&10)); SUM+=ADCW; }
-    AVG=SUM>>6;
  
-    _delay_us(39);
-    SENSOR_LED_OFF; //끄기
-    _delay_ms(10);
-    smoothADC = (AVG*5.0/1023.0) * 0.05 + smoothADC * 0.95;
-    dust_mgm3 = (smoothADC - dust_clean_db) / 0.005;
-        //sprintf(command0,"%f,%d,%d\r\n",smoothADC,dust_mgm3,test); TX0_STR(command0); //테스트용
+    sumVoutReadValue = 0;
+        
+        for(qIdx=0; qIdx<AVG_DUST_VOLTAGE_QCNT; qIdx++ ){
+        SENSOR_LED_ON; //LED 키기
+        _delay_us(280);
+        
+        while(!(ADCSRA&0x10));
+        qVoutReadValue[qIdx]=ADCW;
+    
+        _delay_us(40);
+        SENSOR_LED_OFF; //LED 키기
+        
+        _delay_ms(9); //9초간 off
+        }
+        
+        
+        for (int i = 0; i < AVG_DUST_VOLTAGE_QCNT; i++) {
+            sumVoutReadValue = sumVoutReadValue + qVoutReadValue[i];
+        }
+        avgVoutReadValue = sumVoutReadValue / AVG_DUST_VOLTAGE_QCNT;
+        return (float)(avgVoutReadValue * (5.0 / 1024.0));
+    }
  
-    return dust_mgm3;
+ 
+int getDust_u3mg(char sum_num){ //u3mg 평균화 작업후 단위로 리턴 
+    
+    static int sum_dust=0 , q_dust[30];
+            
+    for(int i = 0; i < sum_num; i++){
+        dustVout = getAvgDustVoltage();
+        q_dust[i] = (dustVout -  dust_clean_db ) / 0.005;        
+    
+    }
+ 
+    for (int i = 0; i < sum_num; i++) {
+        sum_dust = sum_dust + q_dust[i];
+    }
+    sum_dust = sum_dust / sum_num;
+    
+    return sum_dust;
+    
 }
  
  
@@ -225,10 +273,12 @@ int main(void){
         eeprom_write_byte((uint8_t*)EEPROM_RUN_MODE,run_mode);
         eeprom_write_byte((uint8_t*)EEPROM_LED_LIGHT,led_light);
         _delay_ms(2); //저장시간 딜레이        
+        
     }
     else{//만약 데이터가 리셋되지 않으면
         dust_clean_db= eeprom_read_float((float*)EEPROM_DUST_CLEAN);        
         run_mode = eeprom_read_byte((uint8_t*)EEPROM_RUN_MODE);     
+        
     }
     
     if(run_mode == MODE_SETUP) {run_mode=0;}
@@ -237,8 +287,10 @@ int main(void){
     led_blink_counter=5; //led 깜빡임 시작
     while(1){
         if(led_blink_counter==0){break;}
-        sprintf(command0,"CLEAN_UP!_BOOT...Ver11\r\n"); TX0_STR(command0); //테스트용
+        sprintf(command0,"CLEAN_UP!_BOOT...Ver3.0 >< \r\n"); TX0_STR(command0); //테스트용
     }
+ 
+    
     //--------------------여기가 시작
     while (1) {
         if( check_bit(PIND,2) == 0){ //버튼을 누르면
@@ -255,6 +307,7 @@ int main(void){
             if(button_click >= 30){
                 led_blink_counter=10;
                 run_mode=MODE_SETUP;
+            
             } //센서 측정모드
             else {
                 if(++run_mode >= 4){
@@ -272,16 +325,18 @@ int main(void){
             while(1){
             
                 //sprintf(command0,"Senser_SETUP.. %f /%f \r\n",dust_clean_db,smoothADC); TX0_STR(command0); //테스트용
-                dust_status = ADC_Dust(); //센서 값 불러오기...
+                //dust_status = ADC_Dust(); //센서 값 불러오기...
+                dustVout = getAvgDustVoltage();
                 
-                if(dust_clean_db>=smoothADC){
-                    dust_clean_db=smoothADC; //셋팅값 넣기    
-                }
+                //if(dust_clean_db>=dustVout){
+                    dust_clean_db=dustVout; //셋팅값 넣기    
+                //}
                 
-                sprintf(command0,"Senser_SETUP..%f\r\n",smoothADC); TX0_STR(command0); //테스트용
+                sprintf(command0,"Senser_SETUP..%f\r\n",dustVout); TX0_STR(command0); //테스트용
                 
                 if(led_blink_counter ==0){
-                    eeprom_write_float((float*)EEPROM_DUST_CLEAN,dust_clean_db); //리셋된 값 넣기
+                    //eeprom_write_float((float*)EEPROM_DUST_CLEAN,dust_clean_db); //리셋된 값 넣기
+                    eep_write_enable=ON;
                     break;
                 } // led 깜빡 거릴때까지 기다린다
                 
@@ -295,10 +350,9 @@ int main(void){
             if(run_mode == MODE_SENSOR){ OCR1A=fan_speed_db[dust_chart]; } //FAN이 먼지에 따라 자동제어
             else{OCR1A = fan_speed_db[run_mode-1];}//FAN 모드 수동제어
             
+            //여기다가 값 층정 데이터 쓰기
+            dust_status=getDust_u3mg(10);     
             
-            //아래는 먼지 측정 센서 프로그램
-            if(++dust_status_temp==DUST_average){//평균값에 도달하면
-                dust_status = dust_status_sum / DUST_average; //평균 구하기    
                 
                 //아래는 평균값을 기반으로 계산
                 if(!(dust_status<=0)){ //0보다 작은게 아니라면
@@ -319,26 +373,44 @@ int main(void){
                     dust_status =0;
                 }
             //------------------------------
-                dust_status_sum=0; //초기화
-                dust_status_temp=0; //초기화
-                sprintf(command0,"%d,%d,%f,%d,%d,%f\r\n",dust_chart,dust_status,smoothADC,run_mode,led_light,dust_clean_db); TX0_STR(command0); //테스트용
+                
+                if(dust_chart==1 || dust_chart==2){ //디버깅할때 에러체크용
+                    if(++err_count==8192){err_count=0;} //초기화
+                }
+                
+                sprintf(command0,"#D,%f,%d,%f,%d\r\n",dustVout,dust_status,dust_clean_db,dust_chart); TX0_STR(command0); //공기에 대한 데이터
+                //현재 전압 , u3mg 로 변환된 값(평균) , 공기질 기준값 , 공기상태 상/중/하
+                sprintf(command0,"#S,%d,%d\r\n",run_mode,led_light); TX0_STR(command0); //셋팅에 대한 데이터
+                //현재 모드 , led 밝기 상태
+                sprintf(command0,"#G,%d\r\n",err_count); TX0_STR(command0); //디버깅 데이터 데이터
+                sprintf(command0,"Clean_UP Ver3.0\r\n"); TX0_STR(command0); //테스트용
+                
+                
+                //sprintf(command0,"set_clean: NEW %f\r\n",dust_clean_db); TX0_STR(command0); //테스트용
+                //sprintf(command0,"NEW: %f / %d /error: %d\r\n",dustVout, dust_status,err_count); TX0_STR(command0); //테스트용
+                //sprintf(command0,"OLD: %f / %d\r\n",smoothADC, dust_status); TX0_STR(command0); //테스트용
+                
+                
+                
+                //sprintf(command0,"%d,%d,%f,%d,%d,%f\r\n",dust_chart,dust_ugm3,dustVout,run_mode,led_light,dust_clean_db); TX0_STR(command0); //테스트용
+                //sprintf(command0,"%d,%d,%f,%d,%d,%f\r\n",ugm3_test,dust_status,smoothADC,run_mode,led_light,dust_clean_db); TX0_STR(command0); //테스트용
+ 
                 //외부로 출력: 1.상/중/하 먼지 상태 2. mgm3값 3.센서에서 출력된값 4.현재 모드 5. mgm3의 기준값 공기 값
  
-            }
+ 
+    
             
-            else{
-                
-                dust_status_sum += ADC_Dust(); //센서 값 받아서 저장
-                    
-            }
-            if(eep_write_enable == ON){//RUN 모드는 버튼 + 블루투스에서 2개에서 명령이 내려와서 , 한곳에서 통합 저장할수 있도록함
-                eeprom_write_byte((uint8_t*)EEPROM_RUN_MODE,run_mode);//run 값 저장
-                eeprom_write_byte((uint8_t*)EEPROM_LED_LIGHT,led_light);
-                eeprom_write_float((float*)EEPROM_DUST_CLEAN,dust_clean_db);
-                    
-                eep_write_enable=OFF; //지가 종료 끄기
-            }
+            
     //-------------------------------    
         }
+        
+        if(eep_write_enable == ON){//RUN 모드는 버튼 + 블루투스에서 2개에서 명령이 내려와서 , 한곳에서 통합 저장할수 있도록함
+            eeprom_write_byte((uint8_t*)EEPROM_RUN_MODE,run_mode);//run 값 저장
+            eeprom_write_byte((uint8_t*)EEPROM_LED_LIGHT,led_light);
+            eeprom_write_float((float*)EEPROM_DUST_CLEAN,dust_clean_db);
+            eep_write_enable=OFF; //지가 종료 끄기
+        }        
+        
+        
     }
 }

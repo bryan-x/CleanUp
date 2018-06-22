@@ -23,6 +23,13 @@
 // 5. 캘리브레이션 과정중 예외 업데이트(보정)
 // 6. 통신인터페이스 위한 디버깅 정보 주석
 //
+// ===================================================
+// v3.2, 수정: Bryan (byoungsu.kr@gmail.com) 2018.06.21
+// 1. 캘리브레이션 오프셋 적용 ( 0~20 )
+// 2. 동작시간 카운트 변수 2개 추가
+// 3. 동작 시간에 대한 리셋 명령 추가
+// 4. 캘리브레이션 LED 색상 변경
+//
 //
 //상업적 금지! , 원작자 표시 조건하에 공유 및 수정 가능!
 
@@ -43,11 +50,8 @@
 #define LED_NUM 			4
 #define SENSOR_LED_ON 		clr_bit(PORTD,7)
 #define SENSOR_LED_OFF 		set_bit(PORTD,7)
-#define MODE_AUTO 			0
-#define MODE_CALIBRATION 	4
-#define MODE_FAN_1 			1
-#define MODE_FAN_2 			2
-#define MODE_FAN_3 			3
+
+
  
 #define R 0
 #define G 1
@@ -61,10 +65,14 @@
 #define DUST_GRADE_GOOD 	15
 #define DUST_GRADE_NORMAL 	35
 #define DUST_GRADE_BAD		75
- 
-#define EEPROM_RUN_MODE 0x30
-#define EEPROM_DUST_CALIBRATION 0x00
-#define EEPROM_LED_LIGHT 0x40
+
+#define EEPROM_LED_LIGHT 		0x40
+#define EEPROM_COM_MODE 		0x30
+#define EEPROM_ALIVE_DAY		0x28
+#define EEPROM_ALIVE_TOK		0x20
+#define EEPROM_CAL_OFFSET		0x08
+#define EEPROM_CAL_DATA 		0x00
+
 #define DEFAULT_DUST_CALIBRATION	0.105000
  
 #define FAN_SPEED_MAX 		0xFFFF
@@ -72,27 +80,31 @@
 #define FAN_SPEED_NORMAL 	500
 #define FAN_SPEED_GOOD 		250
 //---------------------------------
+#define COM_AUTO 			0x0
+#define COM_FAN_1 			0x1
+#define COM_FAN_2 			0x2
+#define COM_FAN_3 			0x3
+#define COM_CALIBRATION 	0x4
+#define COM_RESET			0x5
+//---------------------------------
 #define RX_WRITE_ENABLE 			0xFD
 #define RX_WRITE_DISABLE 			0xFB
-#define RX_RUN_MODE 		1
+#define RX_COM 				1
 #define RX_LED_LIGHT 		2
-#define RX_CLEAN_DB_ENABLE 	3
-#define RX_CLEAN_DB_DATA 	4
+#define RX_CLEAN_ENABLE 	3
+#define RX_CLEAN_DATA 		4
+#define RX_CLEAN_OFFSET		5
 //---------------------------------
 #define AVG_DUST_CNT 				10
 
-char command0[30];
+char command0[50];	// 30 -> 50
 char rx_db[10];
 unsigned char rx_counter=0;
 char rx_write_enable=0;
  
-unsigned char dust_grade=0;		// 좋음(0), 보통(1), 나쁨(2), 매우나쁨(3).
-int dust_status=0;			// 좋음 0~15ug/m3, 보통 16 ~ 35ug/m3, 나쁨 36 ~ 75ug/m3, 매우나쁨 76이상.
 
 unsigned char button_click=0; //버튼 클릭 시간 체크
-uint8_t run_mode; //공기청정기 모드
-uint8_t led_light=0;
-float dust_calibration_value = 0.0f;
+
 
 //--------------------
 unsigned int fan_speed_db[4]={FAN_SPEED_GOOD,FAN_SPEED_NORMAL,FAN_SPEED_BAD,FAN_SPEED_MAX};
@@ -102,13 +114,21 @@ unsigned char timer_counter=0;
 
 // 모드 색기준 자동:분홍 / 속도1: 녹색 / 속도2: 파랑 / 속도3: 빨강 / 셋업: 주황색 
 unsigned char setup_color[5][3]={ {255,0,221}, {0,255,0}, {0,0,255}, {255,0,0}, {255,187,0} };
-unsigned char sensor_color[4][3]={ {0,255,0}, {255,255,0}, {255,187,0},{255,0,0}}; //맨 마지막은 노란색 , 캘리용
+unsigned char sensor_color[4][3]={ {0,0,255}, {0,255,0}, {255,255,0},{255,0,0}}; //맨 마지막은 노란색 , 캘리용
 unsigned char led_color_buffer[3];
 unsigned char led=0;            
- //---------------------------------- 아래는 EEPROM
-
 char eep_write_enable = 0;
+
+// ---------------------------------
+uint8_t com_mode = 0;
+uint8_t led_light = 0;
+unsigned char dust_grade = 0; 	// 좋음(0), 보통(1), 나쁨(2), 매우나쁨(3).
+int pm_density = 0;			// 좋음 0~15ug/m3, 보통 16 ~ 35ug/m3, 나쁨 36 ~ 75ug/m3, 매우나쁨 76이상.
 float dustVout = 0.0f;
+float cali_data = 0.0f;
+uint8_t cali_offset = 0;			// 0 ~ 20
+uint8_t alive_day = 0;
+uint32_t alive_tok = 0;
 //----------------------------------
 /*/
 시작비트: 0XFD
@@ -121,16 +141,16 @@ float dustVout = 0.0f;
  
 */
  
-void calibration_clean_db(int set_m3ug ,  char enable)
+void calibration_clean_db(char enable, int set_m3ug)
 {
     //디지털 센서 값을 보고 캘리브레이션 하는 방식
     //공식 clean_db 값 = 현재값 - (m3ug(블루투스로 전송받은값) * 0.005);
     
-    if(enable == ON){
-		dust_calibration_value = dustVout - (set_m3ug * 0.005);
+    if( enable == ON ) {
+		cali_data = dustVout - (set_m3ug * 0.005);
     }
 }
- 
+
 ISR(USART_RX_vect)
 {
 	char RX;
@@ -142,18 +162,27 @@ ISR(USART_RX_vect)
 		rx_write_enable = OFF; 
 		rx_counter = 0;
 		//sprintf(command0,"ok/ %d,%d,%d\r\n",rx_db[0],rx_db[1],rx_db[2]); TX0_STR(command0); //테스트용
-		run_mode = rx_db[RX_RUN_MODE];
+		com_mode = rx_db[RX_COM];
 		led_light = rx_db[RX_LED_LIGHT];
 
-		calibration_clean_db(rx_db[RX_CLEAN_DB_DATA],rx_db[RX_CLEAN_DB_ENABLE]);
+		if( com_mode == COM_CALIBRATION ) cali_offset = rx_db[RX_CLEAN_OFFSET];
+		
+		if( com_mode == COM_RESET ) {
+			cali_data = DEFAULT_DUST_CALIBRATION;
+			cali_offset = 0;
+			alive_tok = 0;
+			alive_day = 0;
+			com_mode = COM_AUTO;
+		}
 
-		rx_db[RX_CLEAN_DB_ENABLE] = OFF; //초기화
-		eep_write_enable = ON; // EEPROM 저장 명령어 활성화
+		calibration_clean_db( rx_db[RX_CLEAN_ENABLE], rx_db[RX_CLEAN_DATA] );
+		rx_db[RX_CLEAN_ENABLE] = OFF;
+		eep_write_enable = ON;
 	}
 
 	if( rx_write_enable == ON ) {
-		if( rx_counter == RX_RUN_MODE ) {
-			if( !(RX == rx_db[RX_RUN_MODE] )) { //run mode 가 기존값과 같지 않다면
+		if( rx_counter == RX_COM ) {
+			if( !(RX == rx_db[RX_COM] )) { //run mode 가 기존값과 같지 않다면
 				led_blink_counter = 5; //led 5회 깜빡여라
 			}
 		}
@@ -171,7 +200,8 @@ ISR(TIMER0_COMPA_vect)
                 ws2812b_color(0,0,0,4);
                 led=0;
             } else {
-                for(i=0;i<3;i++){  led_color_buffer[i] = setup_color[run_mode][i] * (led_light * 0.1); } //밝기 조절
+            	if( com_mode == COM_RESET ) { com_mode = COM_AUTO; }
+                for(i=0;i<3;i++){  led_color_buffer[i] = setup_color[com_mode][i] * (led_light * 0.1); } //밝기 조절
                 ws2812b_color(led_color_buffer[R],led_color_buffer[G],led_color_buffer[B],WS2812B_LED_NUM);
                 led_blink_counter--;
             } 
@@ -196,7 +226,7 @@ float getAvgDustVoltage()
 		_delay_us(280);
 
 		while(!(ADCSRA&0x10));
-		qVoutReadValue[i] = ADCW;
+		qVoutReadValue[i] = ADCW + cali_offset;
 
 		_delay_us(40);
 		SENSOR_LED_OFF;
@@ -210,8 +240,8 @@ float getAvgDustVoltage()
 	avgVoutReadValue = sumVoutReadValue / AVG_DUST_CNT;
 	Vo = (float)((avgVoutReadValue * 5.0) / 1024.0);
 	
-	if( Vo < dust_calibration_value ) {		// Vo 측정값이 Voc 보다 작을 경우 보정 처리.
-		dust_calibration_value = Vo;
+	if( Vo < cali_data ) {		// Vo 측정값이 Voc 보다 작을 경우 보정 처리.
+		cali_data = Vo;
 	}
 	return Vo;
 }
@@ -224,7 +254,7 @@ int getDustDensity(void)
 	 
 	for( i = 0; i < sum_num; i++ ) {
 		dustVout = getAvgDustVoltage();
-		dust[i] = (dustVout -  dust_calibration_value) / 0.005;		// ug
+		dust[i] = (dustVout -  cali_data) / 0.005;		// ug
 	}
 
 	for( i = 0; i < sum_num; i++) {
@@ -243,8 +273,8 @@ int main(void){
     // PD2(INT0) = BUTTON 
     // PB0 = WS2812B 
     DDRD=0b11111011; DDRB=0XFF;
-    uart_init(1); //uart_enable
-    ADC_init(); //ADC INIT
+    uart_init(1);
+    ADC_init();
     
     TCCR0A= ((1<<WGM01) | (1<<WGM00)); //CTC 모드 사용
     TCCR0B= ((1<<CS02) | (0<<CS01) | (1<<CS00)); //1024분주
@@ -257,6 +287,10 @@ int main(void){
     OCR1A=0; //초기에는 fan 끄기//FFFF = 강 / 중 500 / 약 250 
     
     SREG=0x80;		// Global Interrupt Enable
+
+	cali_offset = 0;
+	alive_day = 0;
+	alive_tok = 0;
     
     //원리: 320ns 마다 led가 on 되어야 하고 280ns 지나는 시점에 ADC 센싱해야된다.
     //up/m3 공식 미세먼지 농도[μg/m³] = (Vo ? Voc) / 0.005;
@@ -266,25 +300,33 @@ int main(void){
     
     if( led_light > LED_GRADE_MAX || led_light == LED_GRADE_MIN ) {
 		// run 값이 10보다 크면 즉 ISP 로 처음 넣을때 EEPROM 값은 255이다. (initialize)
-        run_mode = MODE_AUTO;
-        dust_calibration_value = DEFAULT_DUST_CALIBRATION;
+        com_mode = COM_AUTO;
+        cali_data = DEFAULT_DUST_CALIBRATION;
+		cali_offset = 0;
         led_light = LED_GRADE_5;
         
-        eeprom_write_float((float*)EEPROM_DUST_CALIBRATION, dust_calibration_value);
-        eeprom_write_byte((uint8_t*)EEPROM_RUN_MODE,run_mode);
+        eeprom_write_float((float*)EEPROM_CAL_DATA, cali_data);
+		eeprom_write_byte((uint8_t*)EEPROM_CAL_OFFSET, (uint8_t)cali_offset);
+		eeprom_write_dword((uint32_t*)EEPROM_ALIVE_TOK,alive_tok);
+		eeprom_write_byte((uint8_t*)EEPROM_ALIVE_DAY,alive_day);
+        eeprom_write_byte((uint8_t*)EEPROM_COM_MODE,com_mode);
         eeprom_write_byte((uint8_t*)EEPROM_LED_LIGHT,led_light);
         _delay_ms(2);	// waiting to save.
     } else {
-        dust_calibration_value = eeprom_read_float((float *)EEPROM_DUST_CALIBRATION);        
-        run_mode = eeprom_read_byte((uint8_t*)EEPROM_RUN_MODE);
+        cali_data = eeprom_read_float((float *)EEPROM_CAL_DATA);
+		cali_offset = eeprom_read_byte((uint8_t*)EEPROM_CAL_OFFSET);
+		alive_tok = eeprom_read_dword((uint32_t*)EEPROM_ALIVE_TOK);
+		alive_day = eeprom_read_byte((uint8_t*)EEPROM_ALIVE_DAY);
+        com_mode = eeprom_read_byte((uint8_t*)EEPROM_COM_MODE);
     }
     
-    if(run_mode == MODE_CALIBRATION) { run_mode = MODE_AUTO; }
+    if(com_mode == COM_CALIBRATION) { com_mode = COM_AUTO; }
+	if(com_mode == COM_RESET) { com_mode = COM_AUTO; }
     
-    led_blink_counter=5; //led 깜빡임 시작
+    led_blink_counter = 5; //led 깜빡임 시작
     while( 1 ) {
         if( led_blink_counter == 0 ) break;
-        //sprintf(command0,"CLEAN_UP!_BOOT...Ver30\r\n"); TX0_STR(command0); //테스트용
+		sprintf(command0,"CLEAN_UP!_BOOT...Ver32\r\n"); TX0_STR(command0); //테스트용
         _delay_ms(1);
     }
 
@@ -302,61 +344,68 @@ int main(void){
             led_blink_counter = 5;
             if( button_click >= 30 ) {
                 led_blink_counter = 10;
-                run_mode = MODE_CALIBRATION;
+                com_mode = COM_CALIBRATION;
             } else {
-                if( ++run_mode >= MODE_CALIBRATION ) {
-                    run_mode = MODE_AUTO;
+                if( ++com_mode >= COM_CALIBRATION ) {
+                    com_mode = COM_AUTO;
                 }
             }
             eep_write_enable = ON;
             _delay_ms(2); //저장시간 딜레이    
         }
 
-        if( run_mode == MODE_CALIBRATION ) {
+        if( com_mode == COM_CALIBRATION ) {
 			OCR1A = 0;	// FAN Off.
-			dust_calibration_value = DEFAULT_DUST_CALIBRATION;
+			cali_data = DEFAULT_DUST_CALIBRATION;
 			while( 1 ) {
 				dustVout = getAvgDustVoltage();
-				dust_calibration_value = dustVout;
-				//sprintf(command0,"Senser_SETUP..%f\r\n",dustVout); TX0_STR(command0); //테스트용
+				cali_data = dustVout;
 				if( led_blink_counter == 0 ) {
 					eep_write_enable = ON;
 					break;
 				}
 			}
-			dust_grade = 3; //노란색 키는용
+			dust_grade = 0;		// 3 -> 0
 			_delay_ms(3000);
-			run_mode = 0;
+			com_mode = COM_AUTO;
         } else {
-			if( run_mode == MODE_AUTO ) {
+			if( com_mode == COM_AUTO ) {
 				OCR1A = fan_speed_db[dust_grade]; 
-			} else { 
-				OCR1A = fan_speed_db[run_mode-1]; 
+			} else if( com_mode == COM_FAN_1 ) { 
+				OCR1A = fan_speed_db[FAN_SPEED_NORMAL]; 
+			} else if( com_mode == COM_FAN_2 ) { 
+				OCR1A = fan_speed_db[FAN_SPEED_BAD]; 
+			} else if( com_mode == COM_FAN_3 ) { 
+				OCR1A = fan_speed_db[FAN_SPEED_MAX]; 				
 			}
 
-			dust_status = getDustDensity();     
+			pm_density = getDustDensity();     
 
-			if( dust_status > 0 ) {
+			if( pm_density > 0 ) {
 				//미세먼지 기준 좋음: 0~15ug/m3 / 보통 16 ~ 35ug/m3 / 나쁨 36이상 / 매우나쁨 76 이상.
-				if( dust_status <= DUST_GRADE_GOOD ) {
+				if( pm_density <= DUST_GRADE_GOOD ) {
 					dust_grade = 0;
-				} else if( dust_status > DUST_GRADE_GOOD && dust_status <= DUST_GRADE_NORMAL ) {
+				} else if( pm_density > DUST_GRADE_GOOD && pm_density <= DUST_GRADE_NORMAL ) {
 					dust_grade = 1;
-				} else if( dust_status > DUST_GRADE_NORMAL && dust_status <= DUST_GRADE_BAD ) {
+				} else if( pm_density > DUST_GRADE_NORMAL && pm_density <= DUST_GRADE_BAD ) {
 					dust_grade = 2;
 				} else {
 					dust_grade = 3;
 				}
 			} else {
-				dust_status = 0;
-			}         
-            sprintf(command0,"%d,%d,%d,%d,%f,%f\r\n",run_mode,led_light,dust_grade,dust_status,dustVout,dust_calibration_value); TX0_STR(command0); //공기에 대한 데이터
+				pm_density = 0;
+			}
+			alive_tok++;
+            sprintf(command0,"%d,%d,%d,%d,%.3f,%.3f,%d,%d,%ld,0\r\n",com_mode,led_light,dust_grade,pm_density,dustVout,cali_data,cali_offset,alive_day,alive_tok); TX0_STR(command0);
 		}
       
 		if( eep_write_enable == ON ) {
-			eeprom_write_byte((uint8_t*)EEPROM_RUN_MODE,run_mode);
+			eeprom_write_byte((uint8_t*)EEPROM_COM_MODE,com_mode);
 			eeprom_write_byte((uint8_t*)EEPROM_LED_LIGHT,led_light);
-			eeprom_write_float((float*)EEPROM_DUST_CALIBRATION,dust_calibration_value);
+			eeprom_write_byte((uint8_t*)EEPROM_CAL_OFFSET, cali_offset);
+			eeprom_write_dword((uint32_t*)EEPROM_ALIVE_TOK,alive_tok);
+			eeprom_write_byte((uint8_t*)EEPROM_ALIVE_DAY,alive_day);
+			eeprom_write_float((float*)EEPROM_CAL_DATA, cali_data);
 			eep_write_enable = OFF;
 		}      
 	}

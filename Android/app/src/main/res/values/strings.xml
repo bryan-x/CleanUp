@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">CleanUp</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_about">CleanUp 관하여</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="logo_cleanup"></string>
+</resources>
